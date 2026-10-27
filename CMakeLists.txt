@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ModelRefine VERSION 1.0.0 LANGUAGES CXX)
+project(ModelRefine VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,10 +12,21 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 find_package(OpenCASCADE CONFIG REQUIRED)
 
+if(WIN32)
+    enable_language(RC)
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/resources/ModelRefine.rc.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/ModelRefine.rc" @ONLY)
+endif()
+
 add_library(ModelRefine SHARED
     src/modelRefine.cpp
     src/refine.cpp
 )
+
+if(WIN32)
+    target_sources(ModelRefine PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ModelRefine.rc")
+endif()
 
 target_compile_definitions(ModelRefine PRIVATE MODELREFINE_LIBRARY)
 target_include_directories(ModelRefine PUBLIC
