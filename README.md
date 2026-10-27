@@ -10,11 +10,29 @@ not have to compile LGPL code into their own binaries.
 - `src/modelRefine.h/.cpp` are ported from FreeCAD 1.1.3
   `src/Mod/Part/App/modelRefine.h/.cpp`
   (Copyright (c) 2011 Thomas Anderson <blobfish[at]gmx.com>, LGPL-2.1-or-later).
-  Only namespaces, includes and language-level details were adjusted; the algorithm is kept
-  identical so future upstream changes can be merged.
+  Only namespaces, includes and language-level details were adjusted, except for the
+  history completion described below (marked with `YI3D:` comments) so that upstream changes
+  can still be merged.
 - `src/refine.cpp` wraps the algorithm with the closed-state/orientation handling used by
   FreeCAD's `TopoShape::makeElementRefine()` and builds a `BRepTools_History` that host
   applications can merge into their own operation histories (e.g. for topological naming).
+
+## History guarantees
+
+`FaceUniter::process()` rebuilds the modification relations from the original shell after
+sewing and edge fusing. The incremental relation list produced by FreeCAD is incomplete:
+faces rebuilt by sewing but not united are keyed by post-sew shapes (which
+`BRepTools_History` drops), and united faces other than the first keep pre-sew values. The
+rebuild guarantees that:
+
+- every relation value is a sub-shape of the returned shell, and
+- every changed face or edge with a topological successor is keyed by the original
+  sub-shape.
+
+The relations are strictly topological: the library never guesses a match from geometry.
+Sub-shapes without a successor (absorbed by a union, or seam segments rebuilt into one
+longer seam) are reported as removed by `refine()`; the host is expected to name the new
+shapes by its own rules. This is the only intentional algorithmic divergence from FreeCAD.
 
 ## License
 

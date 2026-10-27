@@ -23,8 +23,10 @@
  ***************************************************************************/
 
 // Ported from FreeCAD 1.1.3 src/Mod/Part/App/modelRefine.cpp.
-// Only namespaces/includes and language-level details were adjusted; the
-// algorithm is kept identical so future upstream changes can be merged.
+// Only namespaces/includes and language-level details were adjusted, except for the
+// modification-relation rebuild at the end of FaceUniter::process() (marked with YI3D),
+// which makes every relation point at the final shell for topological naming. The rest is
+// kept identical so future upstream changes can be merged.
 
 #include <algorithm>
 #include <cmath>
@@ -1114,6 +1116,7 @@ bool FaceUniter::process()
     if (workShell.IsNull()) {
         return false;
     }
+    const TopoDS_Shell originalShell = workShell;
     modifiedShapes.clear();
     deletedShapes.clear();
     typeObjects.push_back(&getPlaneObject());
@@ -1132,6 +1135,7 @@ bool FaceUniter::process()
 
     ModelRefine::FaceVectorType facesToRemove;
     ModelRefine::FaceVectorType facesToSew;
+    TopTools_DataMapOfShapeShape unitedShapes;
 
     ModelRefine::FaceAdjacencySplitter adjacencySplitter(workShell);
 
@@ -1174,10 +1178,8 @@ bool FaceUniter::process()
                     // marked as modified, producing one single new face. This is the inverse
                     // behaviour to faces that are split e.g. by a boolean cut, where one old shape
                     // is marked as modified, producing multiple new shapes
-                    if (!temp.empty()) {
-                        for (const auto& f : temp) {
-                            modifiedShapes.emplace_back(f, newFace);
-                        }
+                    for (const auto& f : temp) {
+                        unitedShapes.Bind(f, newFace);
                     }
                 }
             }
@@ -1186,6 +1188,8 @@ bool FaceUniter::process()
     if (!facesToSew.empty()) {
         modifiedSignal = true;
         workShell = ModelRefine::removeFaces(workShell, facesToRemove);
+        BRepBuilderAPI_Sewing sew;
+        bool didSew = false;
         TopExp_Explorer xp;
         bool emptyShell = true;
         for (xp.Init(workShell, TopAbs_FACE); xp.More(); xp.Next()) {
@@ -1194,25 +1198,18 @@ bool FaceUniter::process()
         }
 
         if (!emptyShell || facesToSew.size() > 1) {
-            BRepBuilderAPI_Sewing sew;
             sew.Add(workShell);
             FaceVectorType::iterator sewIt;
             for (sewIt = facesToSew.begin(); sewIt != facesToSew.end(); ++sewIt) {
                 sew.Add(*sewIt);
             }
             sew.Perform();
+            didSew = true;
             try {
                 workShell = TopoDS::Shell(sew.SewedShape());
             }
             catch (Standard_Failure&) {
                 return false;
-            }
-            // update the list of modifications
-            for (auto& it : modifiedShapes) {
-                if (sew.IsModified(it.second)) {
-                    it.second = sew.Modified(it.second);
-                    break;
-                }
             }
         }
         else {
@@ -1254,42 +1251,61 @@ bool FaceUniter::process()
                 }
             }
         }
-        // update the list of modifications
         TopTools_DataMapOfShapeShape faceMap;
         edgeFuse.Faces(faceMap);
-        for (mapIt.Initialize(faceMap); mapIt.More(); mapIt.Next()) {
-            bool isModifiedFace = false;
-            for (auto& it : modifiedShapes) {
-                if (mapIt.Key().IsSame(it.second)) {
-                    // Note: IsEqual() for some reason does not work
-                    it.second = mapIt.Value();
-                    isModifiedFace = true;
-                }
-            }
-            if (!isModifiedFace) {
-                // Catch faces that were not united but whose boundary was changed (probably because
-                // several adjacent faces were united)
-                // See https://sourceforge.net/apps/mantisbt/free-cad/view.php?id=873
-                modifiedShapes.emplace_back(mapIt.Key(), mapIt.Value());
-            }
-        }
-        // Handle edges that were fused. See
+        // The old→new edge relations of the fusion. See
         // https://sourceforge.net/apps/mantisbt/free-cad/view.php?id=873
         TopTools_DataMapOfIntegerListOfShape oldEdges;
         TopTools_DataMapOfIntegerShape newEdges;
         edgeFuse.Edges(oldEdges);
         edgeFuse.ResultEdges(newEdges);
-        TopTools_DataMapIteratorOfDataMapOfIntegerListOfShape edgeMapIt;
-        for (edgeMapIt.Initialize(oldEdges); edgeMapIt.More(); edgeMapIt.Next()) {
-            const TopTools_ListOfShape& edges = edgeMapIt.Value();
-            int idx = edgeMapIt.Key();
-            TopTools_ListIteratorOfListOfShape edgeIt;
-            for (edgeIt.Initialize(edges); edgeIt.More(); edgeIt.Next()) {
-                if (newEdges.IsBound(idx)) {
-                    modifiedShapes.emplace_back(edgeIt.Value(), newEdges(idx));
-                }
+
+        // YI3D: build the modification relations from the original shell. Upstream's
+        // incremental list is incomplete — a face rebuilt by sewing but not united is keyed by
+        // its post-sew shape (which BRepTools_History(arguments, maker) drops), and united
+        // faces other than the first keep pre-sew values — so it is not produced at all. Every
+        // relation value here is a sub-shape of the final shell and every changed face or edge
+        // with a topological successor is keyed by a raw sub-shape. Edges without a successor
+        // (for example seam segments rebuilt into one longer seam) are left out and reported
+        // as removed by refine().
+        modifiedShapes.clear();
+        TopTools_IndexedMapOfShape originalFaces;
+        TopExp::MapShapes(originalShell, TopAbs_FACE, originalFaces);
+        TopTools_IndexedMapOfShape originalEdges;
+        TopExp::MapShapes(originalShell, TopAbs_EDGE, originalEdges);
+        TopTools_IndexedMapOfShape finalFaces;
+        TopExp::MapShapes(workShell, TopAbs_FACE, finalFaces);
+        TopTools_IndexedMapOfShape finalEdges;
+        TopExp::MapShapes(workShell, TopAbs_EDGE, finalEdges);
+
+        TopTools_DataMapOfShapeShape fusedEdges;
+        for (TopTools_DataMapIteratorOfDataMapOfIntegerListOfShape it(oldEdges); it.More(); it.Next()) {
+            if (!newEdges.IsBound(it.Key())) continue;
+            for (TopTools_ListIteratorOfListOfShape eit(it.Value()); eit.More(); eit.Next()) {
+                if (!fusedEdges.IsBound(eit.Value())) fusedEdges.Bind(eit.Value(), newEdges(it.Key()));
             }
-            // TODO: Handle vertices that have disappeared in the fusion of the edges
+        }
+
+        for (int i = 1; i <= originalFaces.Extent(); ++i) {
+            const TopoDS_Shape& rawFace = originalFaces(i);
+            const TopoDS_Shape* pUnited = unitedShapes.Seek(rawFace);
+            TopoDS_Shape candidate = pUnited ? *pUnited : rawFace;
+            if (didSew) candidate = sew.ModifiedSubShape(candidate);
+            const TopoDS_Shape finalFace = faceMap.IsBound(candidate) ? faceMap(candidate) : candidate;
+            if (finalFace.IsNull() || finalFace.IsSame(rawFace) || !finalFaces.Contains(finalFace)) continue;
+            modifiedShapes.emplace_back(rawFace, finalFace);
+        }
+        for (int i = 1; i <= originalEdges.Extent(); ++i) {
+            const TopoDS_Shape& rawEdge = originalEdges(i);
+            if (BRep_Tool::Degenerated(TopoDS::Edge(rawEdge))) continue;
+            const TopoDS_Shape candidate = didSew ? sew.ModifiedSubShape(rawEdge) : rawEdge;
+            TopoDS_Shape finalEdge;
+            if (fusedEdges.IsBound(candidate)) finalEdge = fusedEdges(candidate);
+            else if (finalEdges.Contains(candidate)) finalEdge = candidate;
+            if (finalEdge.IsNull() || finalEdge.IsSame(rawEdge) || !finalEdges.Contains(finalEdge)) {
+                continue;
+            }
+            modifiedShapes.emplace_back(rawEdge, finalEdge);
         }
     }
     return true;
